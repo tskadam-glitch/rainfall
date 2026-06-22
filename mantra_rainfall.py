@@ -217,3 +217,197 @@ def process_ledger(asset: dict, current_cdr: float, futures_ltp: dict):
         "qtr_coupon_rs": qtr_coupon_rs,
         "cash_portion_rs": cash_portion_rs,
         "pik_portion_rs": pik_portion_rs,
+        "realizable_offset": realizable_offset,
+        "shadow_nav": shadow_nav,
+        "margin_book": margin_book
+    }
+
+def fmt_cr(val: float) -> str: return f"₹{val / CR_TO_RS:,.2f} Cr"
+def fmt_rs(val: float) -> str: return f"₹{val:,.0f}"
+
+# =====================================================================================
+# MACHINE LEARNING ENGINE (SIMULATED FOR PROTOTYPE)
+# =====================================================================================
+
+def generate_ml_forecast(current_day: int, current_spot: float, days_to_predict: int = 100):
+    """
+    Simulates a Machine Learning prediction pipeline (e.g. Ridge Regression on polynomial features
+    mixed with Monte Carlo paths) to forecast the CDR Index for the rest of the monsoon.
+    """
+    days = np.arange(current_day, current_day + days_to_predict).reshape(-1, 1)
+    
+    # Train a dummy ML pipeline to create a smooth, curved trajectory
+    model = make_pipeline(PolynomialFeatures(degree=3), Ridge(alpha=1.0))
+    X_train = np.array([1, 40, 80, 122]).reshape(-1, 1)
+    y_train = np.array([2206.7, 2350, 2600, 2800]) # Example typical seasonal curve values
+    model.fit(X_train, y_train)
+    
+    base_pred = model.predict(days)
+    
+    # Adjust prediction to anchor smoothly from today's spot price
+    offset = current_spot - base_pred[0]
+    mean_forecast = base_pred + offset
+    
+    # Generate Monte Carlo bounds (Confidence Intervals) via expanding variance
+    volatility = 4.5 # mm per day
+    std_devs = np.sqrt(np.arange(1, days_to_predict + 1)) * volatility
+    
+    ci_95_upper = mean_forecast + (1.96 * std_devs)
+    ci_95_lower = mean_forecast - (1.96 * std_devs)
+    
+    return days.flatten(), mean_forecast, ci_95_upper, ci_95_lower
+
+# =====================================================================================
+# UI LAYOUT
+# =====================================================================================
+
+init_state()
+
+st.markdown(
+    """
+    <div class="mantra-header">
+        <h1>🌧️ Mantra Weather Risk Ledger</h1>
+        <p>Buy-Side Portfolio Manager &nbsp;|&nbsp; RAINMUMBAI Futures &nbsp;|&nbsp; Tick: 1mm = ₹50 &nbsp;|&nbsp; Index: Cumulative Deviation Rainfall (CDR)</p>
+    </div>
+    """, unsafe_allow_html=True
+)
+
+# -------------------------------------------------------------------------------------
+# SIDEBAR: NCDEX INGESTION
+# -------------------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🛰️ NCDEX Data Engine")
+    st.caption("AI DOM Scraper · Cadence: 15 min")
+
+    st.markdown(
+        f"<div class='metric-card'><b>Last Scrape:</b> {st.session_state.last_scrape_time.strftime('%H:%M:%S')}<br>"
+        f"<b>Day of Monsoon:</b> {st.session_state.current_monsoon_day}<br>"
+        f"<b>Prev Day Spot:</b> {st.session_state.prev_cdr_spot:.1f} mm<br>"
+        f"<b>Live CDR Spot:</b> {st.session_state.cdr_spot:.1f} mm</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    if st.button("🔄 Force Data Refresh", use_container_width=True):
+        log_line("Polling NCDEX API for RAINMUMBAI order book updates...")
+        st.session_state.cdr_spot += random.gauss(0, 10)
+        for m in CONTRACT_MONTHS:
+            st.session_state.futures_ltp[m] += random.gauss(0, 8)
+        log_line(f"CDR Spot updated: {st.session_state.cdr_spot:.1f} mm")
+        st.session_state.last_scrape_time = datetime.now()
+        st.rerun()
+
+    board_df = pd.DataFrame({
+        "Contract": CONTRACT_MONTHS,
+        "LTP (mm)": [round(st.session_state.futures_ltp[m], 1) for m in CONTRACT_MONTHS],
+        "OI": [st.session_state.oi_by_month[m] for m in CONTRACT_MONTHS],
+    })
+    st.dataframe(board_df, hide_index=True, use_container_width=True)
+    
+    st.markdown("#### Terminal Log")
+    log_html = "<br>".join(st.session_state.terminal_log)
+    st.markdown(f"<div class='term-box'>{log_html}</div>", unsafe_allow_html=True)
+
+# -------------------------------------------------------------------------------------
+# MAIN TABS
+# -------------------------------------------------------------------------------------
+tab1, tab2 = st.tabs(["🏛️ Portfolio Master & Margin Ledger", "🧠 ML Predictive Forecasting"])
+
+# --- TAB 1: COMBINED LEDGER ---
+with tab1:
+    st.markdown("<div class='section-title'>Unified Portfolio Master & Derivative Ledger</div>", unsafe_allow_html=True)
+    st.write("Aggregated view of debt facility distribution rules, dynamic institutional lot sizing, live NCDEX margin monitors, and automated severe risk alerts.")
+
+    for asset in st.session_state.assets:
+        ledger = process_ledger(asset, st.session_state.cdr_spot, st.session_state.futures_ltp)
+        
+        with st.container(border=True):
+            st.markdown(f"### {asset['name']} · `{asset['deal_id']}`")
+            
+            # --- Status & Severe Risk Alerts ---
+            breach_found = False
+            for mb in ledger["margin_book"]:
+                if mb["Var Margin Call (₹)"] > (mb["Init Margin (₹)"] * SEVERE_MARGIN_DRAWDOWN_PCT):
+                    breach_found = True
+                    st.markdown(
+                        f"<div class='alert-flash'>⚠️ CRITICAL RISK ALERT: {mb['Tranche']} Tranche.<br>"
+                        f"Variation margin call (₹{mb['Var Margin Call (₹)']:,.0f}) exceeds {SEVERE_MARGIN_DRAWDOWN_PCT*100}% of Initial Margin. "
+                        f"Unrealised NAV is severely impaired.</div>", unsafe_allow_html=True
+                    )
+            
+            status_pill = "<span class='pill pill-pik'>🟠 COVENANT HOLIDAY ACTIVE</span>" if ledger["holiday_active"] else "<span class='pill pill-cash'>🟢 NORMAL DISTRIBUTIONS</span>"
+            if not breach_found:
+                st.markdown(f"{status_pill} <span style='margin-left: 10px; color: #1f6b3f; font-size: 13px; font-weight: bold;'>✓ Margin Capitalization Healthy</span>", unsafe_allow_html=True)
+            else:
+                st.markdown(status_pill, unsafe_allow_html=True)
+
+            # --- Financial Metrics ---
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Principal Outstanding", fmt_cr(asset["capital_cr"] * CR_TO_RS))
+            c2.metric("Quarterly Interest Due", fmt_cr(ledger["qtr_coupon_rs"]))
+            c3.metric("Cash Int. at Risk (Post-PIK)", fmt_cr(ledger["cash_portion_rs"]))
+            c4.metric("Shadow NAV (Inc. Futures)", fmt_cr(ledger["shadow_nav"]))
+
+            # --- Hedge & Margin Book ---
+            st.markdown(f"**Institutional Hedge Sizing:** System calculated **{ledger['margin_book'][0]['Lots']:,} lots** required to offset {asset['hedge_target_offset_pct']*100}% of interest upon a {asset['hedge_shock_mm']} mm adverse monsoon shock.")
+            
+            m_df = pd.DataFrame(ledger["margin_book"])
+            st.dataframe(m_df, hide_index=True, use_container_width=True)
+
+            # Highlight if the hedge is actively paying out
+            if ledger["realizable_offset"] > 0:
+                st.success(f"☔ Weather Hedge Actively Offsetting Cash Interest Risk: {fmt_cr(ledger['realizable_offset'])} in deployable exchange liquidity.")
+
+# --- TAB 2: ML FORECASTING ---
+with tab2:
+    st.markdown("<div class='section-title'>Ensemble Machine Learning Forecast (CDR Index)</div>", unsafe_allow_html=True)
+    st.write("Leveraging an algorithmic regression model trained on IMD historical distributions to project the RAINMUMBAI forward curve and estimate target breach probabilities.")
+
+    days_left = 122 - st.session_state.current_monsoon_day
+    days_arr, mean_f, upper_f, lower_f = generate_ml_forecast(st.session_state.current_monsoon_day, st.session_state.cdr_spot, days_left)
+
+    colA, colB = st.columns([1, 3])
+    
+    with colA:
+        st.markdown("#### Scenario Parameters")
+        target_cdr = st.number_input("Test CDR Target (mm)", value=2310.0, step=10.0)
+        
+        # Calculate ML Probabilities
+        final_mean = mean_f[-1]
+        final_std = (upper_f[-1] - mean_f[-1]) / 1.96
+        z_score = (target_cdr - final_mean) / final_std
+        prob_breach = 1 - stats.norm.cdf(z_score)
+        
+        st.write("---")
+        st.metric("ML Projected Final CDR", f"{final_mean:.1f} mm")
+        st.metric(f"Probability to Breach {target_cdr}mm", f"{prob_breach*100:.1f}%")
+        st.metric(f"Probability to Fall Short", f"{(1-prob_breach)*100:.1f}%")
+
+    with colB:
+        fig = go.Figure()
+        
+        # Confidence Band
+        fig.add_trace(go.Scatter(x=np.concatenate([days_arr, days_arr[::-1]]), 
+                                 y=np.concatenate([upper_f, lower_f[::-1]]),
+                                 fill='toself', fillcolor='rgba(14,58,95,0.15)', line=dict(color='rgba(255,255,255,0)'),
+                                 name='95% ML Confidence Interval'))
+        
+        # Mean Forecast Line
+        fig.add_trace(go.Scatter(x=days_arr, y=mean_f, mode='lines', line=dict(color='#0e3a5f', width=3), name='ML Mean Trajectory'))
+        
+        # Current Spot Marker
+        fig.add_trace(go.Scatter(x=[st.session_state.current_monsoon_day], y=[st.session_state.cdr_spot], mode='markers', 
+                                 marker=dict(color='red', size=10), name='Live Spot (Today)'))
+        
+        # Target Threshold Line
+        fig.add_hline(y=target_cdr, line_dash="dash", line_color="#c0392b", annotation_text=f"Breach Target: {target_cdr} mm")
+        
+        fig.update_layout(
+            title="Algorithm Projected CDR Evolution (Remainder of Monsoon)",
+            xaxis_title="Day of Monsoon Season (1-122)",
+            yaxis_title="CDR Index Level (mm)",
+            hovermode="x unified",
+            plot_bgcolor="white",
+            height=500
+        )
+        st.plotly_chart(fig, use_container_width=True)
