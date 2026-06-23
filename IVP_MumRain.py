@@ -257,7 +257,7 @@ with tab2:
             "Rationale": d["rationale"]
         })
         
-    st.dataframe(pd.DataFrame(deal_data).style.applymap(
+    st.dataframe(pd.DataFrame(deal_data).style.map(
         lambda x: 'color: #166534; font-weight: bold;' if isinstance(x, str) and x.startswith('₹') and '-' not in x 
         else ('color: #991b1b; font-weight: bold;' if isinstance(x, str) and x.startswith('₹-') else ''),
         subset=['Unrealized P&L']
